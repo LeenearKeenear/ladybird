@@ -1,0 +1,259 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [master, develop]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_preset:
+        description: 'Build preset (Sanitizer, Distribution, Debug)'
+        required: true
+        default: 'Sanitizer'
+        type: choice
+        options:
+          - Sanitizer
+          - Distribution
+          - Debug
+          - All_Debug
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || format('{0}-{1}', github.ref, github.run_number) }}
+  cancel-in-progress: true
+
+env:
+  LADYBIRD_SOURCE_DIR: ${{ github.workspace }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  VCPKG_ROOT: ${{ github.workspace }}/Build/vcpkg
+  CCACHE_COMPILERCHECK: "%compiler% -v"
+
+jobs:
+  build-windows:
+    runs-on: ${{ matrix.runner }}
+    if: github.repository == 'LadybirdBrowser/ladybird'
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-16vcpu-windows-2025
+            arch: x86_64
+            toolchain: ClangCL
+            build_preset: Sanitizer
+            
+          - runner: blacksmith-8vcpu-windows-2025
+            arch: x86_64
+            toolchain: ClangCL
+            build_preset: Distribution
+
+    name: ${{ matrix.arch }} - ${{ matrix.build_preset }} - ${{ matrix.toolchain }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6.0.2
+        if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Checkout code (PR)
+        uses: actions/checkout@v6.0.2
+        if: ${{ github.event_name == 'pull_request' }}
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+
+      - name: Set Up Environment
+        uses: ./.github/actions/setup
+        id: setup
+        with:
+          os: Windows
+          arch: ${{ matrix.arch }}
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Restore Build Cache
+        uses: ./.github/actions/cache-restore
+        id: cache-restore
+        with:
+          os: Windows
+          arch: ${{ matrix.arch }}
+          toolchain: ${{ matrix.toolchain }}
+          cache_key_extra: ${{ matrix.build_preset }}
+          ccache_path: ${{ steps.setup.outputs.ccache_path }}
+          vcpkg_cache_path: ${{ steps.setup.outputs.vcpkg_cache_path }}
+
+      - name: Install LLVM/Clang (Windows)
+        shell: pwsh
+        run: |
+          # Download LLVM
+          $llvm_version = "18.1.0"
+          $download_url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvm_version}/LLVM-${llvm_version}-win64.exe"
+          $installer = "${{ github.workspace }}\llvm-installer.exe"
+          
+          Write-Host "Downloading LLVM ${llvm_version}..."
+          Invoke-WebRequest -Uri $download_url -OutFile $installer
+          
+          Write-Host "Installing LLVM..."
+          & $installer /S /D="C:\LLVM"
+          
+          # Add LLVM to PATH
+          Add-Content $env:GITHUB_PATH "C:\LLVM\bin"
+          
+          clang-cl --version
+          lld-link --version
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install ninja cmake
+
+      - name: Create Build Environment
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        env:
+          VCPKG_CACHE_SAS: ${{ github.ref == 'refs/heads/master' && secrets.VCPKG_CACHE_SAS || '' }}
+          VCPKG_CACHE_MODE: ${{ github.ref == 'refs/heads/master' && 'write' || '' }}
+        run: |
+          $cmake_options = @(
+            "-DENABLE_CI_BASELINE_CPU=ON"
+            "-DCMAKE_SYSTEM_VERSION=10.0.19041.0"
+            "-DCMAKE_VS_PLATFORM_TOOLSET=ClangCL"
+          )
+          
+          if ("${{ matrix.build_preset }}" -ne "Sanitizer") {
+            $cmake_options += "-DINCLUDE_WASM_SPEC_TESTS=ON"
+            $cmake_options += "-DWASM_SPEC_TEST_SKIP_FORMATTING=ON"
+          }
+          
+          Write-Host "Building with CMake preset: ${{ matrix.build_preset }}"
+          cmake --preset "${{ matrix.build_preset }}" -B Build @cmake_options
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "CMake configuration failed"
+            exit 1
+          }
+
+      - name: Build Ladybird
+        working-directory: ${{ github.workspace }}/Build
+        shell: pwsh
+        run: |
+          Write-Host "Starting build..."
+          cmake --build . --config Release --parallel $env:NUMBER_OF_PROCESSORS
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Build failed"
+            exit 1
+          }
+          
+          Write-Host "Build completed successfully"
+
+      - name: Install Ladybird
+        working-directory: ${{ github.workspace }}/Build
+        shell: pwsh
+        run: |
+          cmake --install . --strip --prefix "${{ github.workspace }}/Install"
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Installation failed"
+            exit 1
+          }
+
+      - name: Run Tests (Sanitizer only)
+        if: ${{ matrix.build_preset == 'Sanitizer' }}
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        env:
+          TESTS_ONLY: 1
+          ASAN_OPTIONS: 'log_path=asan.log'
+          UBSAN_OPTIONS: 'log_path=ubsan.log'
+        run: |
+          ctest --preset "${{ matrix.build_preset }}" `
+            --output-on-failure `
+            --test-dir Build `
+            --timeout 1800
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Some tests failed"
+          }
+
+      - name: Run Tests (Other presets)
+        if: ${{ matrix.build_preset != 'Sanitizer' && matrix.build_preset != 'All_Debug' }}
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        env:
+          TESTS_ONLY: 1
+        run: |
+          ctest --output-on-failure `
+            --test-dir Build `
+            --timeout 1800
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Some tests failed"
+          }
+
+      - name: Upload Build Artifacts
+        if: ${{ success() && matrix.build_preset == 'Distribution' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ladybird-windows-${{ matrix.arch }}-${{ matrix.build_preset }}
+          path: ${{ github.workspace }}/Install
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload Test Artifacts
+        if: ${{ always() && matrix.build_preset != 'All_Debug' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: libweb-test-artifacts-windows-${{ matrix.arch }}-${{ matrix.build_preset }}
+          path: ${{ github.workspace }}/Build/Tests/LibWeb/test-web/test-dumps/
+          retention-days: 0
+          if-no-files-found: ignore
+
+      - name: Sanitizer Output
+        if: ${{ !cancelled() && matrix.build_preset == 'Sanitizer' }}
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        run: |
+          $log_files = Get-ChildItem -Path . -MaxDepth 1 -Filter "asan.log.*" -o -Filter "ubsan.log.*"
+          
+          if ($log_files.Count -eq 0) {
+            Write-Host "No sanitizer issues found."
+          } else {
+            foreach ($log_file in $log_files) {
+              Write-Host "=== $($log_file.Name) ==="
+              Get-Content $log_file.FullName
+            }
+            Write-Warning "Sanitizer errors detected; see above for details."
+          }
+
+      - name: Save Build Cache
+        uses: ./.github/actions/cache-save
+        with:
+          arch: ${{ matrix.arch }}
+          ccache_path: ${{ steps.setup.outputs.ccache_path }}
+          ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
+          vcpkg_cache_path: ${{ steps.setup.outputs.vcpkg_cache_path }}
+          vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
+
+      - name: Publish Results on Failure
+        if: ${{ failure() }}
+        shell: pwsh
+        run: |
+          Write-Host "Build failed - Check the logs above for details"
+          Write-Host "Build Preset: ${{ matrix.build_preset }}"
+          Write-Host "Toolchain: ${{ matrix.toolchain }}"
+          Write-Host "Architecture: ${{ matrix.arch }}"
+
+  build-summary:
+    runs-on: ubuntu-latest
+    if: ${{ always() && github.repository == 'LadybirdBrowser/ladybird' }}
+    needs: build-windows
+    
+    steps:
+      - name: Check Build Status
+        run: |
+          if [ "${{ needs.build-windows.result }}" = "failure" ]; then
+            echo "❌ Windows build failed"
+            exit 1
+          elif [ "${{ needs.build-windows.result }}" = "success" ]; then
+            echo "✅ Windows build succeeded"
+          else
+            echo "⚠️  Windows build cancelled or skipped"
+          fi
